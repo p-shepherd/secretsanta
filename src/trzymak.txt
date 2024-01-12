@@ -1,0 +1,199 @@
+const { onRequest } = require("firebase-functions/v2/https");
+const logger = require("firebase-functions/logger");
+
+const functions = require("firebase-functions");
+
+exports.generateRandomNumber = functions.https.onCall((data, context) => {
+  const randomNumber = Math.floor(Math.random() * 100) + 1;
+  return randomNumber;
+});
+
+const admin = require("firebase-admin");
+
+admin.initializeApp();
+
+exports.createGroupDocument = functions
+  .runWith({
+    timeoutSeconds: 120, // Sets timeout to 120 seconds
+    memory: "1GB", // Sets memory allocation to 1GB
+  })
+  .https.onCall(async (data, context) => {
+    // Extract parameters from the data object
+    const { groupId, name, uniqueId, statusV } = data;
+
+    // Construct the document data
+    const newEntry = {
+      userName: name,
+      uniqueId: uniqueId,
+      status: statusV,
+    };
+
+    // Reference to the Firestore database
+    const db = admin.firestore();
+    const docRef = db.collection("queue").doc(groupId);
+
+    try {
+      const doc = await docRef.get();
+      if (doc.exists) {
+        // Check if the waitingList array exists and if it contains an entry with the same name
+        const waitingList = doc.data().waitingList || [];
+        if (
+          !waitingList.some(
+            (entry) => entry.userName === name && entry.status === statusV
+          )
+        ) {
+          // Update the document with the new entry in the waitingList array
+          await docRef.update({
+            waitingList: admin.firestore.FieldValue.arrayUnion(newEntry),
+          });
+        }
+      } else {
+        // Create a new document with the waitingList array containing the new entry
+        await docRef.set({ waitingList: [newEntry] });
+      }
+
+      // Call processQueue function and return its result
+      const processQueueResult = await processQueue({ groupId });
+      return processQueueResult;
+    } catch (error) {
+      console.error("Error processing document: ", error);
+      return { success: false, error: error.message };
+    }
+  });
+
+async function processQueue(data) {
+  // Ensure groupId is provided
+  if (!data.groupId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      'The function must be called with one argument "groupId".'
+    );
+  }
+
+  const groupId = data.groupId;
+  const db = admin.firestore();
+  const queueRef = db.collection("queue").doc(groupId);
+
+  return db.runTransaction(async (transaction) => {
+    const doc = await transaction.get(queueRef);
+
+    if (!doc.exists) {
+      throw new functions.https.HttpsError(
+        "not-found",
+        `No queue found with groupId: ${groupId}`
+      );
+    }
+
+    const queueData = doc.data();
+    const waitingList = queueData.waitingList || [];
+    const pendingUser = waitingList.find((user) => user.status === "pending");
+    const name = pendingUser.userName;
+    const uniqueId = pendingUser.uniqueId;
+    console.log("pendingUser", pendingUser);
+    console.log("Calling drawPerson with:", { groupId, name, uniqueId });
+
+    if (!pendingUser) {
+      return { message: "No pending users in the queue." };
+    }
+
+    // Call Function 3 (assuming it's a callable function) with groupId, name, and uniqueId
+    // Replace 'callFunction3' with your actual function invocation
+    const drawnPersonResult = await drawPerson({
+      groupId,
+      name: name,
+      uniqueId: uniqueId,
+    });
+
+    // Update the status of the user in waitingList
+    const updatedWaitingList = waitingList.map((user) =>
+      user.uniqueId === pendingUser.uniqueId
+        ? { ...user, status: "drawed" }
+        : user
+    );
+
+    transaction.update(queueRef, { waitingList: updatedWaitingList });
+
+    return drawnPersonResult;
+  });
+}
+async function drawPerson(data) {
+  const { groupId, name, uniqueId } = data;
+  console.log("drawPerson called with:", { groupId, name, uniqueId });
+  const db = admin.firestore();
+  const usersRef = db.collection("users");
+  const queueRef = db.collection("queue").doc(groupId);
+
+  try {
+    console.log("Fetching users from Firestore");
+    const usersSnapshot = await usersRef.get();
+    console.log("Users fetched successfully");
+
+    let drawnName = null;
+
+    // Process to find and update the drawn person in the users collection
+    for (const userDoc of usersSnapshot.docs) {
+      console.log("Processing user:", userDoc.id);
+      const userData = userDoc.data();
+      if (userData.groups) {
+        console.log("Checking groups for user:", userDoc.id);
+        const foundGroup = userData.groups.find(
+          (group) => group.groupId === groupId
+        );
+
+        if (!foundGroup) {
+          console.log("Group not found for user:", userDoc.id);
+          continue;
+        }
+
+        console.log("Checking if user has already been drawn:", userDoc.id);
+        const checkIfDrawed = foundGroup.persons.find(
+          (person) => person.unique_id === uniqueId
+        );
+        if (checkIfDrawed && checkIfDrawed.had_drawed) {
+          console.log("User has already been drawn:", userDoc.id);
+          return { drawnName: checkIfDrawed.does_present_for };
+        }
+
+        console.log("Performing draw operation for user:", userDoc.id);
+        const otherPersons = foundGroup.persons.filter(
+          (person) => person.unique_id !== uniqueId
+        );
+        if (otherPersons.length > 0) {
+          const randomPersonIndex = Math.floor(
+            Math.random() * otherPersons.length
+          );
+          const randomPerson = otherPersons[randomPersonIndex];
+          randomPerson.has_been_drawn = true;
+          randomPerson.is_making_them_present = name;
+          drawnName = randomPerson.name;
+
+          const drawingPerson = foundGroup.persons.find(
+            (person) => person.unique_id === uniqueId
+          );
+          if (drawingPerson) {
+            drawingPerson.had_drawed = true;
+            drawingPerson.does_present_for = drawnName;
+            foundGroup.persons[randomPersonIndex] = randomPerson;
+            foundGroup.persons = foundGroup.persons.map((person) =>
+              person.unique_id === uniqueId ? drawingPerson : person
+            );
+            console.log("Updating user document:", userDoc.id);
+            await userDoc.ref.update({ groups: userData.groups });
+            console.log("User document updated successfully:", userDoc.id);
+          }
+        }
+      }
+    }
+
+    if (drawnName) {
+      return { drawnName: drawnName ? drawnName : "No suitable person found" };
+    }
+  } catch (error) {
+    console.error("Error in drawPerson function:", error);
+    throw new functions.https.HttpsError(
+      "unknown",
+      "Error in drawPerson function",
+      error
+    );
+  }
+}
